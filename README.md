@@ -8,7 +8,7 @@ The platform is designed to be deployed using CloudFormation and container image
 
 ## Architecture Summary
 
-![Diagram]./architecture.png
+![Diagram](./architecture.png)
 
 * **Compute:** Amazon ECS (Fargate)
 * **Ingress:** Application Load Balancer (HTTPS, TLS via ACM)
