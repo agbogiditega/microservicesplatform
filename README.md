@@ -78,7 +78,8 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides \
     EnvironmentName="$ENV" \
-    AcmCertificateArn="arn:aws:acm:us-east-1:ACCOUNT_ID:certificate/XXXXXXXX"
+    AcmCertificateArn="arn:aws:acm:us-east-1:ACCOUNT_ID:certificate/XXXXXXXX" \
+    DbPassword="REPLACE_WITH_STRONG_PASSWORD"
 ```    
 
 ## Wait for completion
