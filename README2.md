@@ -40,11 +40,19 @@ This repo matches the spec and also implements `/<prefix>/health` so external AL
 Set shell variables:
 
 ```bash
-export AWS_REGION="us-east-2"     # set to your region
+export AWS_REGION="us-east-1"     # set to your region
 export ENV="dev"                  # dev or staging
 export STACK_NAME="$ENV-microservices-platform"
 export ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 ```
+
+```
+$Env:AWS_REGION = "us-east-1"
+$Env:ENV = "dev"
+$Env:STACK_NAME = "$($Env:ENV)-microservices-platform"
+$Env:ACCOUNT_ID = $(aws sts get-caller-identity --query Account --output text)
+```
+
 
 ---
 
