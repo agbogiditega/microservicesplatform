@@ -1,24 +1,28 @@
-FROM public.ecr.aws/amazonlinux/amazonlinux:2
+# syntax=docker/dockerfile:1.5
+# AWS-maintained Node.js 20 runtime image (multi-arch), reliable for ECS builds
+FROM public.ecr.aws/docker/library/node:20-bookworm-slim
 
-# Install Node.js 20 (NodeSource) + minimal tools
-RUN yum -y update \
-    && yum -y install curl ca-certificates \
-    && curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - \
-    && yum -y install nodejs \
-    && yum -y clean all \
-    && rm -rf /var/cache/yum
+ENV NODE_ENV=production \
+    PORT=8080
 
 WORKDIR /app
 
 # Create non-root user
 RUN useradd -m appuser
 
-COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev || npm install --omit=dev
+# Copy package manifests first for caching
+COPY package*.json ./
 
-COPY src ./src
+# Install prod deps only
+RUN npm ci --omit=dev
 
+# Copy app
+COPY . .
+
+RUN chown -R appuser:appuser /app
 USER appuser
+
 EXPOSE 8080
 
 CMD ["npm", "start"]
+

@@ -1,15 +1,18 @@
-AWSTemplateFormatVersion: "2010-09-09"
-Description: >
-  XYZ Corporation - AWS Distributed Microservices Platform (dev/staging).
-  VPC (2 public, 4 private), NAT, ALB (HTTPS), ECS Fargate cluster + 4 services,
-  RDS PostgreSQL, SQS + DLQ, Secrets Manager, SSM Parameter Store,
-  KMS-encrypted CloudWatch Logs, alarms, and autoscaling.
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  XYZ Corporation - AWS Distributed Microservices Platform (dev/staging). VPC (2 public, 4 private), NAT, ALB (HTTPS), ECS Fargate cluster + 4 services, RDS PostgreSQL, SQS + DLQ, Secrets Manager, SSM Parameter Store, KMS-encrypted CloudWatch Logs, alarms, and ECS Service Auto Scaling.
 
 Parameters:
   EnvironmentName:
     Type: String
     Default: dev
-    AllowedValues: [dev, staging]
+    AllowedValues:
+      - dev
+      - staging
+
+  AcmCertificateArn:
+    Type: String
+    Description: ACM certificate ARN for ALB HTTPS listener (same region as stack).
 
   VpcCidr:
     Type: String
@@ -35,17 +38,13 @@ Parameters:
     Type: String
     Default: 10.0.22.0/24
 
-  AcmCertificateArn:
-    Type: String
-    Description: ACM certificate ARN for ALB HTTPS listener (same region as stack).
-
   ContainerPort:
     Type: Number
     Default: 8080
 
   DesiredCount:
     Type: Number
-    Default: 2
+    Default: 0
 
   Cpu:
     Type: Number
@@ -54,7 +53,6 @@ Parameters:
     Type: Number
     Default: 512
 
-  # ECR image tags (repositories are created by this stack; images must be pushed separately)
   AuthImageTag:
     Type: String
     Default: latest
@@ -74,12 +72,10 @@ Parameters:
   DbUsername:
     Type: String
     Default: platform_admin
-    MinLength: 1
   DbPassword:
     Type: String
     NoEcho: true
-    MinLength: 12
-    Description: Password stored in Secrets Manager (min 12 chars recommended).
+    Description: Required. Password stored in Secrets Manager (NoEcho).
 
   DbInstanceClass:
     Type: String
@@ -88,7 +84,6 @@ Parameters:
     Type: Number
     Default: 20
 
-  # Autoscaling
   MinTasks:
     Type: Number
     Default: 2
@@ -101,57 +96,44 @@ Parameters:
 
 Resources:
 
-  ############################
-  # KMS KEYS (Logs + Secrets)
-  ############################
+  # -------------------------
+  # KMS keys (no role principals in key policy to avoid CFN cycles)
+  # -------------------------
   LogsKmsKey:
     Type: AWS::KMS::Key
     Properties:
-      Description: !Sub "${EnvironmentName} - KMS key for CloudWatch Logs encryption"
+      Description: !Sub ${EnvironmentName} - KMS key for CloudWatch Logs encryption
       EnableKeyRotation: true
       KeyPolicy:
-        Version: "2012-10-17"
+        Version: '2012-10-17'
         Statement:
-          - Sid: AllowAccountAdmin
+          - Sid: EnableAccountPermissions
             Effect: Allow
             Principal:
-              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
-            Action: "kms:*"
-            Resource: "*"
-
-  LogsKmsAlias:
-    Type: AWS::KMS::Alias
-    Properties:
-      AliasName: !Sub "alias/${EnvironmentName}-cw-logs"
-      TargetKeyId: !Ref LogsKmsKey
-
-
-
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action: kms:*
+            Resource: '*'
 
   SecretsKmsKey:
     Type: AWS::KMS::Key
     Properties:
-      Description: !Sub "${EnvironmentName} - KMS key for Secrets Manager encryption"
+      Description: !Sub ${EnvironmentName} - KMS key for Secrets Manager encryption
       EnableKeyRotation: true
       KeyPolicy:
-        Version: "2012-10-17"
+        Version: '2012-10-17'
         Statement:
-          - Sid: AllowAccountAdmin
+          - Sid: EnableAccountPermissions
             Effect: Allow
             Principal:
-              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
-            Action: "kms:*"
-            Resource: "*"
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+              Service: secretsmanager.amazonaws.com
+            Action: kms:*
+            Resource: '*'
 
-  SecretsKmsAlias:
-    Type: AWS::KMS::Alias
-    Properties:
-      AliasName: !Sub "alias/${EnvironmentName}-secrets"
-      TargetKeyId: !Ref SecretsKmsKey
-
-  ############################
-  # VPC + SUBNETS + ROUTES
-  ############################
+  # -------------------------
+  # VPC + Subnets + NAT
+  # -------------------------
   VPC:
     Type: AWS::EC2::VPC
     Properties:
@@ -160,10 +142,11 @@ Resources:
       EnableDnsHostnames: true
       Tags:
         - Key: Name
-          Value: !Sub "${EnvironmentName}-vpc"
+          Value: !Sub ${EnvironmentName}-vpc
 
   InternetGateway:
     Type: AWS::EC2::InternetGateway
+
   AttachGateway:
     Type: AWS::EC2::VPCGatewayAttachment
     Properties:
@@ -176,10 +159,12 @@ Resources:
       VpcId: !Ref VPC
       CidrBlock: !Ref PublicSubnet1Cidr
       MapPublicIpOnLaunch: true
-      AvailabilityZone: !Select [0, !GetAZs ""]
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
       Tags:
         - Key: Name
-          Value: !Sub "${EnvironmentName}-public-a"
+          Value: !Sub ${EnvironmentName}-public-a
 
   PublicSubnet2:
     Type: AWS::EC2::Subnet
@@ -187,50 +172,60 @@ Resources:
       VpcId: !Ref VPC
       CidrBlock: !Ref PublicSubnet2Cidr
       MapPublicIpOnLaunch: true
-      AvailabilityZone: !Select [1, !GetAZs ""]
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ''
       Tags:
         - Key: Name
-          Value: !Sub "${EnvironmentName}-public-b"
+          Value: !Sub ${EnvironmentName}-public-b
 
   PrivateSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
       CidrBlock: !Ref PrivateSubnet1Cidr
-      AvailabilityZone: !Select [0, !GetAZs ""]
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
       Tags:
         - Key: Name
-          Value: !Sub "${EnvironmentName}-private-a-1"
+          Value: !Sub ${EnvironmentName}-private-a-1
 
   PrivateSubnet2:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
       CidrBlock: !Ref PrivateSubnet2Cidr
-      AvailabilityZone: !Select [0, !GetAZs ""]
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
       Tags:
         - Key: Name
-          Value: !Sub "${EnvironmentName}-private-a-2"
+          Value: !Sub ${EnvironmentName}-private-a-2
 
   PrivateSubnet3:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
       CidrBlock: !Ref PrivateSubnet3Cidr
-      AvailabilityZone: !Select [1, !GetAZs ""]
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ''
       Tags:
         - Key: Name
-          Value: !Sub "${EnvironmentName}-private-b-1"
+          Value: !Sub ${EnvironmentName}-private-b-1
 
   PrivateSubnet4:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
       CidrBlock: !Ref PrivateSubnet4Cidr
-      AvailabilityZone: !Select [1, !GetAZs ""]
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ''
       Tags:
         - Key: Name
-          Value: !Sub "${EnvironmentName}-private-b-2"
+          Value: !Sub ${EnvironmentName}-private-b-2
 
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
@@ -250,6 +245,7 @@ Resources:
     Properties:
       SubnetId: !Ref PublicSubnet1
       RouteTableId: !Ref PublicRouteTable
+
   PublicSubnet2Assoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
@@ -260,6 +256,7 @@ Resources:
     Type: AWS::EC2::EIP
     Properties:
       Domain: vpc
+
   NatEipB:
     Type: AWS::EC2::EIP
     Properties:
@@ -270,23 +267,18 @@ Resources:
     Properties:
       AllocationId: !GetAtt NatEipA.AllocationId
       SubnetId: !Ref PublicSubnet1
-      Tags:
-        - Key: Name
-          Value: !Sub "${EnvironmentName}-nat-a"
 
   NatGatewayB:
     Type: AWS::EC2::NatGateway
     Properties:
       AllocationId: !GetAtt NatEipB.AllocationId
       SubnetId: !Ref PublicSubnet2
-      Tags:
-        - Key: Name
-          Value: !Sub "${EnvironmentName}-nat-b"
 
   PrivateRouteTableA:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref VPC
+
   PrivateRouteTableB:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -311,25 +303,28 @@ Resources:
     Properties:
       SubnetId: !Ref PrivateSubnet1
       RouteTableId: !Ref PrivateRouteTableA
+
   PrivateSubnet2Assoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref PrivateSubnet2
       RouteTableId: !Ref PrivateRouteTableA
+
   PrivateSubnet3Assoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref PrivateSubnet3
       RouteTableId: !Ref PrivateRouteTableB
+
   PrivateSubnet4Assoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref PrivateSubnet4
       RouteTableId: !Ref PrivateRouteTableB
 
-  ############################
-  # SECURITY GROUPS
-  ############################
+  # -------------------------
+  # Security Groups
+  # -------------------------
   ALBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -373,30 +368,38 @@ Resources:
   AuthEcrRepo:
     Type: AWS::ECR::Repository
     Properties:
-      RepositoryName: !Sub "${EnvironmentName}/auth-service"
-      ImageScanningConfiguration: { ScanOnPush: true }
-      EncryptionConfiguration: { EncryptionType: AES256 }
+      RepositoryName: !Sub ${EnvironmentName}/auth-service
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
 
   UserEcrRepo:
     Type: AWS::ECR::Repository
     Properties:
-      RepositoryName: !Sub "${EnvironmentName}/user-service"
-      ImageScanningConfiguration: { ScanOnPush: true }
-      EncryptionConfiguration: { EncryptionType: AES256 }
+      RepositoryName: !Sub ${EnvironmentName}/user-service
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
 
   BillingEcrRepo:
     Type: AWS::ECR::Repository
     Properties:
-      RepositoryName: !Sub "${EnvironmentName}/billing-service"
-      ImageScanningConfiguration: { ScanOnPush: true }
-      EncryptionConfiguration: { EncryptionType: AES256 }
+      RepositoryName: !Sub ${EnvironmentName}/billing-service
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
 
   NotificationEcrRepo:
     Type: AWS::ECR::Repository
     Properties:
-      RepositoryName: !Sub "${EnvironmentName}/notification-service"
-      ImageScanningConfiguration: { ScanOnPush: true }
-      EncryptionConfiguration: { EncryptionType: AES256 }
+      RepositoryName: !Sub ${EnvironmentName}/notification-service
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
 
   ############################
   # SQS + DLQ
@@ -404,48 +407,38 @@ Resources:
   PlatformDLQ:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: !Sub "${EnvironmentName}-platform-dlq"
+      QueueName: !Sub ${EnvironmentName}-platform-dlq
       MessageRetentionPeriod: 1209600
 
   PlatformQueue:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: !Sub "${EnvironmentName}-platform-queue"
+      QueueName: !Sub ${EnvironmentName}-platform-queue
       VisibilityTimeout: 60
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt PlatformDLQ.Arn
         maxReceiveCount: 5
 
   ############################
-  # SSM PARAMETER STORE (config)
+  # SSM PARAMETER STORE
   ############################
   ParamLogLevel:
     Type: AWS::SSM::Parameter
     Properties:
-      Name: !Sub "/${EnvironmentName}/platform/LOG_LEVEL"
+      Name: !Sub /${EnvironmentName}/platform/LOG_LEVEL
       Type: String
-      Value: "INFO"
-
-  ParamEnvironment:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: !Sub "/${EnvironmentName}/platform/ENVIRONMENT"
-      Type: String
-      Value: !Ref EnvironmentName
+      Value: INFO
 
   ############################
-  # SECRETS MANAGER (DB creds)
+  # SECRETS MANAGER (KMS-encrypted)
   ############################
   DbCredentialsSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
-      Name: !Sub "${EnvironmentName}/platform/db-credentials"
+      Name: !Sub ${EnvironmentName}/platform/db-credentials
+      KmsKeyId: !Ref SecretsKmsKey
       SecretString: !Sub |
-        {
-          "username": "${DbUsername}",
-          "password": "${DbPassword}",
-          "dbname": "${DbName}"
-        }
+        {"username":"${DbUsername}","password":"${DbPassword}","dbname":"${DbName}"}
 
   ############################
   # RDS POSTGRESQL
@@ -453,7 +446,7 @@ Resources:
   DBSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
     Properties:
-      DBSubnetGroupDescription: !Sub "${EnvironmentName} DB subnet group"
+      DBSubnetGroupDescription: !Sub ${EnvironmentName} DB subnet group
       SubnetIds:
         - !Ref PrivateSubnet1
         - !Ref PrivateSubnet3
@@ -461,9 +454,9 @@ Resources:
   Database:
     Type: AWS::RDS::DBInstance
     Properties:
-      DBInstanceIdentifier: !Sub "${EnvironmentName}-platform-db"
+      DBInstanceIdentifier: !Sub ${EnvironmentName}-platform-db
       Engine: postgres
-      EngineVersion: "16.6"
+      EngineVersion: '16.6'
       DBInstanceClass: !Ref DbInstanceClass
       AllocatedStorage: !Ref DbAllocatedStorage
       StorageEncrypted: true
@@ -476,7 +469,6 @@ Resources:
         - !Ref RDSSecurityGroup
       DBSubnetGroupName: !Ref DBSubnetGroup
       BackupRetentionPeriod: 7
-      DeletionProtection: true
 
   ############################
   # CLOUDWATCH LOG GROUPS (KMS-encrypted)
@@ -484,51 +476,51 @@ Resources:
   AuthLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub "/ecs/${EnvironmentName}/auth-service"
+      LogGroupName: !Sub /ecs/${EnvironmentName}/auth-service
+      KmsKeyId: !GetAtt LogsKmsKey.Arn
       RetentionInDays: 30
-
   UserLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub "/ecs/${EnvironmentName}/user-service"
+      LogGroupName: !Sub /ecs/${EnvironmentName}/user-service
+      KmsKeyId: !GetAtt LogsKmsKey.Arn
       RetentionInDays: 30
-
   BillingLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub "/ecs/${EnvironmentName}/billing-service"
+      LogGroupName: !Sub /ecs/${EnvironmentName}/billing-service
+      KmsKeyId: !GetAtt LogsKmsKey.Arn
       RetentionInDays: 30
-
   NotificationLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub "/ecs/${EnvironmentName}/notification-service"
+      LogGroupName: !Sub /ecs/${EnvironmentName}/notification-service
+      KmsKeyId: !GetAtt LogsKmsKey.Arn
       RetentionInDays: 30
 
   ############################
-  # IAM (Execution Role + App Task Role with least privilege)
+  # IAM ROLES
   ############################
   ECSTaskExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${EnvironmentName}-ecs-task-exec"
+      RoleName: !Sub ${EnvironmentName}-ecs-task-exec
       AssumeRolePolicyDocument:
-        Version: "2012-10-17"
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
-            Principal: { Service: ecs-tasks.amazonaws.com }
+            Principal:
+              Service: ecs-tasks.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: !Sub "${EnvironmentName}-ecs-task-exec-policy"
+        - PolicyName: !Sub ${EnvironmentName}-ecs-task-exec-policy
           PolicyDocument:
-            Version: "2012-10-17"
+            Version: '2012-10-17'
             Statement:
-              # ECR pull
               - Effect: Allow
                 Action:
                   - ecr:GetAuthorizationToken
-                  - secretsmanager:GetSecretValue
-                Resource: "*"
+                Resource: '*'
               - Effect: Allow
                 Action:
                   - ecr:BatchCheckLayerAvailability
@@ -539,52 +531,54 @@ Resources:
                   - !GetAtt UserEcrRepo.Arn
                   - !GetAtt BillingEcrRepo.Arn
                   - !GetAtt NotificationEcrRepo.Arn
-              # CloudWatch Logs write
               - Effect: Allow
                 Action:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource:
-                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${EnvironmentName}/*:*"
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${EnvironmentName}/*:*
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref DbCredentialsSecret
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !GetAtt SecretsKmsKey.Arn
 
   ECSTaskRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${EnvironmentName}-ecs-task-role"
+      RoleName: !Sub ${EnvironmentName}-ecs-task-role
       AssumeRolePolicyDocument:
-        Version: "2012-10-17"
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
-            Principal: { Service: ecs-tasks.amazonaws.com }
+            Principal:
+              Service: ecs-tasks.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: !Sub "${EnvironmentName}-platform-app-policy"
+        - PolicyName: !Sub ${EnvironmentName}-platform-runtime-policy
           PolicyDocument:
-            Version: "2012-10-17"
+            Version: '2012-10-17'
             Statement:
-              # Read config from Parameter Store
               - Effect: Allow
                 Action:
                   - ssm:GetParameter
                   - ssm:GetParameters
                   - ssm:GetParametersByPath
-                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${EnvironmentName}/platform/*"
-
-              # Read DB creds from Secrets Manager
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${EnvironmentName}/platform/*
               - Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
                 Resource: !Ref DbCredentialsSecret
-
-              # Use KMS to decrypt secrets/logs as needed
               - Effect: Allow
                 Action:
                   - kms:Decrypt
+                  - kms:DescribeKey
                 Resource:
                   - !GetAtt SecretsKmsKey.Arn
                   - !GetAtt LogsKmsKey.Arn
-
-              # SQS consume/produce
               - Effect: Allow
                 Action:
                   - sqs:SendMessage
@@ -597,17 +591,17 @@ Resources:
                   - !GetAtt PlatformDLQ.Arn
 
   ############################
-  # ECS CLUSTER + ALB
+  # ECS + ALB
   ############################
   ECSCluster:
     Type: AWS::ECS::Cluster
     Properties:
-      ClusterName: !Sub "${EnvironmentName}-ecs-cluster"
+      ClusterName: !Sub ${EnvironmentName}-ecs-cluster
 
   LoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
-      Name: !Sub "${EnvironmentName}-alb"
+      Name: !Sub ${EnvironmentName}-alb
       Scheme: internet-facing
       Subnets:
         - !Ref PublicSubnet1
@@ -625,7 +619,7 @@ Resources:
         - Type: redirect
           RedirectConfig:
             Protocol: HTTPS
-            Port: "443"
+            Port: '443'
             StatusCode: HTTP_301
 
   HttpsListener:
@@ -640,56 +634,57 @@ Resources:
       DefaultActions:
         - Type: fixed-response
           FixedResponseConfig:
-            StatusCode: "404"
+            StatusCode: '404'
             ContentType: text/plain
-            MessageBody: "No matching route."
+            MessageBody: No matching route.
 
-  ############################
-  # TARGET GROUPS + RULES
-  ############################
   AuthTG:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      Name: !Sub "${EnvironmentName}-tg-auth"
+      Name: !Sub ${EnvironmentName}-tg-auth
       VpcId: !Ref VPC
       Port: !Ref ContainerPort
       Protocol: HTTP
       TargetType: ip
       HealthCheckPath: /health
-      Matcher: { HttpCode: "200-399" }
+      Matcher:
+        HttpCode: 200-399
 
   UserTG:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      Name: !Sub "${EnvironmentName}-tg-user"
+      Name: !Sub ${EnvironmentName}-tg-user
       VpcId: !Ref VPC
       Port: !Ref ContainerPort
       Protocol: HTTP
       TargetType: ip
       HealthCheckPath: /health
-      Matcher: { HttpCode: "200-399" }
+      Matcher:
+        HttpCode: 200-399
 
   BillingTG:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      Name: !Sub "${EnvironmentName}-tg-billing"
+      Name: !Sub ${EnvironmentName}-tg-billing
       VpcId: !Ref VPC
       Port: !Ref ContainerPort
       Protocol: HTTP
       TargetType: ip
       HealthCheckPath: /health
-      Matcher: { HttpCode: "200-399" }
+      Matcher:
+        HttpCode: 200-399
 
   NotificationTG:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      Name: !Sub "${EnvironmentName}-tg-notify"
+      Name: !Sub ${EnvironmentName}-tg-notify
       VpcId: !Ref VPC
       Port: !Ref ContainerPort
       Protocol: HTTP
       TargetType: ip
       HealthCheckPath: /health
-      Matcher: { HttpCode: "200-399" }
+      Matcher:
+        HttpCode: 200-399
 
   AuthRule:
     Type: AWS::ElasticLoadBalancingV2::ListenerRule
@@ -698,7 +693,8 @@ Resources:
       Priority: 10
       Conditions:
         - Field: path-pattern
-          Values: ["/auth/*"]
+          Values:
+            - /auth/*
       Actions:
         - Type: forward
           TargetGroupArn: !Ref AuthTG
@@ -710,7 +706,8 @@ Resources:
       Priority: 20
       Conditions:
         - Field: path-pattern
-          Values: ["/users/*"]
+          Values:
+            - /users/*
       Actions:
         - Type: forward
           TargetGroupArn: !Ref UserTG
@@ -722,7 +719,8 @@ Resources:
       Priority: 30
       Conditions:
         - Field: path-pattern
-          Values: ["/billing/*"]
+          Values:
+            - /billing/*
       Actions:
         - Type: forward
           TargetGroupArn: !Ref BillingTG
@@ -734,21 +732,21 @@ Resources:
       Priority: 40
       Conditions:
         - Field: path-pattern
-          Values: ["/notify/*"]
+          Values:
+            - /notify/*
       Actions:
         - Type: forward
           TargetGroupArn: !Ref NotificationTG
 
   ############################
-  # ECS TASK DEFINITIONS (4)
+  # TASK DEFINITIONS
   ############################
-  # Common environment variables are injected here; secrets are referenced from Secrets Manager.
-  # The DB endpoint comes from the RDS resource.
   AuthTaskDef:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Family: !Sub "${EnvironmentName}-auth-service"
-      RequiresCompatibilities: [FARGATE]
+      Family: !Sub ${EnvironmentName}-auth-service
+      RequiresCompatibilities:
+        - FARGATE
       NetworkMode: awsvpc
       Cpu: !Ref Cpu
       Memory: !Ref Memory
@@ -756,26 +754,27 @@ Resources:
       TaskRoleArn: !GetAtt ECSTaskRole.Arn
       ContainerDefinitions:
         - Name: auth-service
-          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EnvironmentName}/auth-service:${AuthImageTag}"
-          PortMappings: [{ ContainerPort: !Ref ContainerPort }]
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EnvironmentName}/auth-service:${AuthImageTag}
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
           Environment:
+            - Name: SERVICE_NAME
+              Value: auth-service
+            - Name: SERVICE_PREFIX
+              Value: auth
             - Name: ENVIRONMENT
               Value: !Ref EnvironmentName
             - Name: LOG_LEVEL
               Value: !GetAtt ParamLogLevel.Value
             - Name: SQS_QUEUE_URL
               Value: !Ref PlatformQueue
-            - Name: DB_HOST
-              Value: !GetAtt Database.Endpoint.Address
-            - Name: DB_PORT
-              Value: "5432"
-            - Name: DB_NAME
-              Value: !Ref DbName
+            - Name: DB_ENDPOINT
+              Value: !Sub ${Database.Endpoint.Address}:5432
           Secrets:
             - Name: DB_USERNAME
-              ValueFrom: !Sub "${DbCredentialsSecret}:username::"
+              ValueFrom: !Sub '${DbCredentialsSecret}:username::'
             - Name: DB_PASSWORD
-              ValueFrom: !Sub "${DbCredentialsSecret}:password::"
+              ValueFrom: !Sub '${DbCredentialsSecret}:password::'
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -786,8 +785,9 @@ Resources:
   UserTaskDef:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Family: !Sub "${EnvironmentName}-user-service"
-      RequiresCompatibilities: [FARGATE]
+      Family: !Sub ${EnvironmentName}-user-service
+      RequiresCompatibilities:
+        - FARGATE
       NetworkMode: awsvpc
       Cpu: !Ref Cpu
       Memory: !Ref Memory
@@ -795,26 +795,27 @@ Resources:
       TaskRoleArn: !GetAtt ECSTaskRole.Arn
       ContainerDefinitions:
         - Name: user-service
-          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EnvironmentName}/user-service:${UserImageTag}"
-          PortMappings: [{ ContainerPort: !Ref ContainerPort }]
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EnvironmentName}/user-service:${UserImageTag}
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
           Environment:
+            - Name: SERVICE_NAME
+              Value: user-service
+            - Name: SERVICE_PREFIX
+              Value: users
             - Name: ENVIRONMENT
               Value: !Ref EnvironmentName
             - Name: LOG_LEVEL
               Value: !GetAtt ParamLogLevel.Value
             - Name: SQS_QUEUE_URL
               Value: !Ref PlatformQueue
-            - Name: DB_HOST
-              Value: !GetAtt Database.Endpoint.Address
-            - Name: DB_PORT
-              Value: "5432"
-            - Name: DB_NAME
-              Value: !Ref DbName
+            - Name: DB_ENDPOINT
+              Value: !Sub ${Database.Endpoint.Address}:5432
           Secrets:
             - Name: DB_USERNAME
-              ValueFrom: !Sub "${DbCredentialsSecret}:username::"
+              ValueFrom: !Sub '${DbCredentialsSecret}:username::'
             - Name: DB_PASSWORD
-              ValueFrom: !Sub "${DbCredentialsSecret}:password::"
+              ValueFrom: !Sub '${DbCredentialsSecret}:password::'
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -825,8 +826,9 @@ Resources:
   BillingTaskDef:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Family: !Sub "${EnvironmentName}-billing-service"
-      RequiresCompatibilities: [FARGATE]
+      Family: !Sub ${EnvironmentName}-billing-service
+      RequiresCompatibilities:
+        - FARGATE
       NetworkMode: awsvpc
       Cpu: !Ref Cpu
       Memory: !Ref Memory
@@ -834,26 +836,27 @@ Resources:
       TaskRoleArn: !GetAtt ECSTaskRole.Arn
       ContainerDefinitions:
         - Name: billing-service
-          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EnvironmentName}/billing-service:${BillingImageTag}"
-          PortMappings: [{ ContainerPort: !Ref ContainerPort }]
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EnvironmentName}/billing-service:${BillingImageTag}
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
           Environment:
+            - Name: SERVICE_NAME
+              Value: billing-service
+            - Name: SERVICE_PREFIX
+              Value: billing
             - Name: ENVIRONMENT
               Value: !Ref EnvironmentName
             - Name: LOG_LEVEL
               Value: !GetAtt ParamLogLevel.Value
             - Name: SQS_QUEUE_URL
               Value: !Ref PlatformQueue
-            - Name: DB_HOST
-              Value: !GetAtt Database.Endpoint.Address
-            - Name: DB_PORT
-              Value: "5432"
-            - Name: DB_NAME
-              Value: !Ref DbName
+            - Name: DB_ENDPOINT
+              Value: !Sub ${Database.Endpoint.Address}:5432
           Secrets:
             - Name: DB_USERNAME
-              ValueFrom: !Sub "${DbCredentialsSecret}:username::"
+              ValueFrom: !Sub '${DbCredentialsSecret}:username::'
             - Name: DB_PASSWORD
-              ValueFrom: !Sub "${DbCredentialsSecret}:password::"
+              ValueFrom: !Sub '${DbCredentialsSecret}:password::'
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -864,8 +867,9 @@ Resources:
   NotificationTaskDef:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Family: !Sub "${EnvironmentName}-notification-service"
-      RequiresCompatibilities: [FARGATE]
+      Family: !Sub ${EnvironmentName}-notification-service
+      RequiresCompatibilities:
+        - FARGATE
       NetworkMode: awsvpc
       Cpu: !Ref Cpu
       Memory: !Ref Memory
@@ -873,26 +877,27 @@ Resources:
       TaskRoleArn: !GetAtt ECSTaskRole.Arn
       ContainerDefinitions:
         - Name: notification-service
-          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EnvironmentName}/notification-service:${NotificationImageTag}"
-          PortMappings: [{ ContainerPort: !Ref ContainerPort }]
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EnvironmentName}/notification-service:${NotificationImageTag}
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
           Environment:
+            - Name: SERVICE_NAME
+              Value: notification-service
+            - Name: SERVICE_PREFIX
+              Value: notify
             - Name: ENVIRONMENT
               Value: !Ref EnvironmentName
             - Name: LOG_LEVEL
               Value: !GetAtt ParamLogLevel.Value
             - Name: SQS_QUEUE_URL
               Value: !Ref PlatformQueue
-            - Name: DB_HOST
-              Value: !GetAtt Database.Endpoint.Address
-            - Name: DB_PORT
-              Value: "5432"
-            - Name: DB_NAME
-              Value: !Ref DbName
+            - Name: DB_ENDPOINT
+              Value: !Sub ${Database.Endpoint.Address}:5432
           Secrets:
             - Name: DB_USERNAME
-              ValueFrom: !Sub "${DbCredentialsSecret}:username::"
+              ValueFrom: !Sub '${DbCredentialsSecret}:username::'
             - Name: DB_PASSWORD
-              ValueFrom: !Sub "${DbCredentialsSecret}:password::"
+              ValueFrom: !Sub '${DbCredentialsSecret}:password::'
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -901,13 +906,15 @@ Resources:
               awslogs-stream-prefix: ecs
 
   ############################
-  # ECS SERVICES (4)
+  # ECS SERVICES
   ############################
   AuthService:
     Type: AWS::ECS::Service
-    DependsOn: [HttpsListener, AuthRule]
+    DependsOn:
+      - HttpsListener
+      - AuthRule
     Properties:
-      ServiceName: !Sub "${EnvironmentName}-auth-service"
+      ServiceName: !Sub ${EnvironmentName}-auth-service
       Cluster: !Ref ECSCluster
       LaunchType: FARGATE
       DesiredCount: !Ref DesiredCount
@@ -917,8 +924,13 @@ Resources:
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: DISABLED
-          SecurityGroups: [!Ref ECSTasksSecurityGroup]
-          Subnets: [!Ref PrivateSubnet1, !Ref PrivateSubnet2, !Ref PrivateSubnet3, !Ref PrivateSubnet4]
+          SecurityGroups:
+            - !Ref ECSTasksSecurityGroup
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+            - !Ref PrivateSubnet3
+            - !Ref PrivateSubnet4
       TaskDefinition: !Ref AuthTaskDef
       LoadBalancers:
         - ContainerName: auth-service
@@ -927,9 +939,11 @@ Resources:
 
   UserService:
     Type: AWS::ECS::Service
-    DependsOn: [HttpsListener, UserRule]
+    DependsOn:
+      - HttpsListener
+      - UserRule
     Properties:
-      ServiceName: !Sub "${EnvironmentName}-user-service"
+      ServiceName: !Sub ${EnvironmentName}-user-service
       Cluster: !Ref ECSCluster
       LaunchType: FARGATE
       DesiredCount: !Ref DesiredCount
@@ -939,8 +953,13 @@ Resources:
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: DISABLED
-          SecurityGroups: [!Ref ECSTasksSecurityGroup]
-          Subnets: [!Ref PrivateSubnet1, !Ref PrivateSubnet2, !Ref PrivateSubnet3, !Ref PrivateSubnet4]
+          SecurityGroups:
+            - !Ref ECSTasksSecurityGroup
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+            - !Ref PrivateSubnet3
+            - !Ref PrivateSubnet4
       TaskDefinition: !Ref UserTaskDef
       LoadBalancers:
         - ContainerName: user-service
@@ -949,9 +968,11 @@ Resources:
 
   BillingService:
     Type: AWS::ECS::Service
-    DependsOn: [HttpsListener, BillingRule]
+    DependsOn:
+      - HttpsListener
+      - BillingRule
     Properties:
-      ServiceName: !Sub "${EnvironmentName}-billing-service"
+      ServiceName: !Sub ${EnvironmentName}-billing-service
       Cluster: !Ref ECSCluster
       LaunchType: FARGATE
       DesiredCount: !Ref DesiredCount
@@ -961,8 +982,13 @@ Resources:
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: DISABLED
-          SecurityGroups: [!Ref ECSTasksSecurityGroup]
-          Subnets: [!Ref PrivateSubnet1, !Ref PrivateSubnet2, !Ref PrivateSubnet3, !Ref PrivateSubnet4]
+          SecurityGroups:
+            - !Ref ECSTasksSecurityGroup
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+            - !Ref PrivateSubnet3
+            - !Ref PrivateSubnet4
       TaskDefinition: !Ref BillingTaskDef
       LoadBalancers:
         - ContainerName: billing-service
@@ -971,9 +997,11 @@ Resources:
 
   NotificationService:
     Type: AWS::ECS::Service
-    DependsOn: [HttpsListener, NotificationRule]
+    DependsOn:
+      - HttpsListener
+      - NotificationRule
     Properties:
-      ServiceName: !Sub "${EnvironmentName}-notification-service"
+      ServiceName: !Sub ${EnvironmentName}-notification-service
       Cluster: !Ref ECSCluster
       LaunchType: FARGATE
       DesiredCount: !Ref DesiredCount
@@ -983,8 +1011,13 @@ Resources:
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: DISABLED
-          SecurityGroups: [!Ref ECSTasksSecurityGroup]
-          Subnets: [!Ref PrivateSubnet1, !Ref PrivateSubnet2, !Ref PrivateSubnet3, !Ref PrivateSubnet4]
+          SecurityGroups:
+            - !Ref ECSTasksSecurityGroup
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+            - !Ref PrivateSubnet3
+            - !Ref PrivateSubnet4
       TaskDefinition: !Ref NotificationTaskDef
       LoadBalancers:
         - ContainerName: notification-service
@@ -992,39 +1025,39 @@ Resources:
           TargetGroupArn: !Ref NotificationTG
 
   ############################
-  # AUTOSCALING (per service)
+  # AUTOSCALING (CPU target tracking)
   ############################
   ECSAutoScalingRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${EnvironmentName}-ecs-autoscaling-role"
+      RoleName: !Sub ${EnvironmentName}-ecs-autoscaling-role
       AssumeRolePolicyDocument:
-        Version: "2012-10-17"
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
-            Principal: { Service: application-autoscaling.amazonaws.com }
+            Principal:
+              Service: application-autoscaling.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: !Sub "${EnvironmentName}-ecs-autoscaling-policy"
+        - PolicyName: !Sub ${EnvironmentName}-ecs-autoscaling-policy
           PolicyDocument:
-            Version: "2012-10-17"
+            Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
-                  - application-autoscaling:*
-                  - cloudwatch:PutMetricAlarm
-                  - cloudwatch:DescribeAlarms
-                  - cloudwatch:GetMetricStatistics
                   - ecs:DescribeServices
                   - ecs:UpdateService
-                Resource: "*"
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DescribeAlarms
+                  - application-autoscaling:*
+                Resource: '*'
 
   AuthScalableTarget:
     Type: AWS::ApplicationAutoScaling::ScalableTarget
     Properties:
       MaxCapacity: !Ref MaxTasks
       MinCapacity: !Ref MinTasks
-      ResourceId: !Sub "service/${ECSCluster}/${AuthService.Name}"
+      ResourceId: !Sub service/${ECSCluster}/${AuthService.Name}
       RoleARN: !GetAtt ECSAutoScalingRole.Arn
       ScalableDimension: ecs:service:DesiredCount
       ServiceNamespace: ecs
@@ -1032,7 +1065,7 @@ Resources:
   AuthScalingPolicy:
     Type: AWS::ApplicationAutoScaling::ScalingPolicy
     Properties:
-      PolicyName: !Sub "${EnvironmentName}-auth-cpu-scaling"
+      PolicyName: !Sub ${EnvironmentName}-auth-cpu-scaling
       PolicyType: TargetTrackingScaling
       ScalingTargetId: !Ref AuthScalableTarget
       TargetTrackingScalingPolicyConfiguration:
@@ -1047,7 +1080,7 @@ Resources:
     Properties:
       MaxCapacity: !Ref MaxTasks
       MinCapacity: !Ref MinTasks
-      ResourceId: !Sub "service/${ECSCluster}/${UserService.Name}"
+      ResourceId: !Sub service/${ECSCluster}/${UserService.Name}
       RoleARN: !GetAtt ECSAutoScalingRole.Arn
       ScalableDimension: ecs:service:DesiredCount
       ServiceNamespace: ecs
@@ -1055,7 +1088,7 @@ Resources:
   UserScalingPolicy:
     Type: AWS::ApplicationAutoScaling::ScalingPolicy
     Properties:
-      PolicyName: !Sub "${EnvironmentName}-user-cpu-scaling"
+      PolicyName: !Sub ${EnvironmentName}-user-cpu-scaling
       PolicyType: TargetTrackingScaling
       ScalingTargetId: !Ref UserScalableTarget
       TargetTrackingScalingPolicyConfiguration:
@@ -1070,7 +1103,7 @@ Resources:
     Properties:
       MaxCapacity: !Ref MaxTasks
       MinCapacity: !Ref MinTasks
-      ResourceId: !Sub "service/${ECSCluster}/${BillingService.Name}"
+      ResourceId: !Sub service/${ECSCluster}/${BillingService.Name}
       RoleARN: !GetAtt ECSAutoScalingRole.Arn
       ScalableDimension: ecs:service:DesiredCount
       ServiceNamespace: ecs
@@ -1078,7 +1111,7 @@ Resources:
   BillingScalingPolicy:
     Type: AWS::ApplicationAutoScaling::ScalingPolicy
     Properties:
-      PolicyName: !Sub "${EnvironmentName}-billing-cpu-scaling"
+      PolicyName: !Sub ${EnvironmentName}-billing-cpu-scaling
       PolicyType: TargetTrackingScaling
       ScalingTargetId: !Ref BillingScalableTarget
       TargetTrackingScalingPolicyConfiguration:
@@ -1093,7 +1126,7 @@ Resources:
     Properties:
       MaxCapacity: !Ref MaxTasks
       MinCapacity: !Ref MinTasks
-      ResourceId: !Sub "service/${ECSCluster}/${NotificationService.Name}"
+      ResourceId: !Sub service/${ECSCluster}/${NotificationService.Name}
       RoleARN: !GetAtt ECSAutoScalingRole.Arn
       ScalableDimension: ecs:service:DesiredCount
       ServiceNamespace: ecs
@@ -1101,7 +1134,7 @@ Resources:
   NotificationScalingPolicy:
     Type: AWS::ApplicationAutoScaling::ScalingPolicy
     Properties:
-      PolicyName: !Sub "${EnvironmentName}-notify-cpu-scaling"
+      PolicyName: !Sub ${EnvironmentName}-notify-cpu-scaling
       PolicyType: TargetTrackingScaling
       ScalingTargetId: !Ref NotificationScalableTarget
       TargetTrackingScalingPolicyConfiguration:
@@ -1112,12 +1145,12 @@ Resources:
         ScaleOutCooldown: 60
 
   ############################
-  # CLOUDWATCH ALARMS
+  # CLOUDWATCH ALARM (ALB 5xx)
   ############################
   Alb5xxAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: !Sub "${EnvironmentName}-alb-5xx-high"
+      AlarmName: !Sub ${EnvironmentName}-alb-5xx-high
       AlarmDescription: ALB 5XX errors high
       Namespace: AWS/ApplicationELB
       MetricName: HTTPCode_ELB_5XX_Count
@@ -1131,33 +1164,16 @@ Resources:
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
 
-  AuthCpuHighAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${EnvironmentName}-auth-cpu-high"
-      Namespace: AWS/ECS
-      MetricName: CPUUtilization
-      Dimensions:
-        - Name: ClusterName
-          Value: !Ref ECSCluster
-        - Name: ServiceName
-          Value: !GetAtt AuthService.Name
-      Statistic: Average
-      Period: 60
-      EvaluationPeriods: 5
-      Threshold: 80
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-
 Outputs:
-  VpcId:
-    Value: !Ref VPC
   AlbDnsName:
+    Description: Application Load Balancer DNS
     Value: !GetAtt LoadBalancer.DNSName
-  PlatformQueueUrl:
-    Value: !Ref PlatformQueue
   DatabaseEndpoint:
+    Description: RDS endpoint address
     Value: !GetAtt Database.Endpoint.Address
+  PlatformQueueUrl:
+    Description: SQS queue URL
+    Value: !Ref PlatformQueue
   AuthRepoUri:
     Value: !GetAtt AuthEcrRepo.RepositoryUri
   UserRepoUri:
