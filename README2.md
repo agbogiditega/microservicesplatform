@@ -1,235 +1,198 @@
-# AWS Microservices Platform
+# AWS Microservices Platform (XYZ Corporation)
 
-Auth • User • Billing • Notification
+This repository contains a **complete, executable** implementation of the microservices platform aligned to the reference materials in `systemoverview.zip`.
 
-This repository contains a production-style repo for deploying a distributed microservices platform on AWS ECS Fargate, fronted by an Application Load Balancer (HTTPS) and backed by RDS, SQS, Secrets Manager, Parameter Store, CloudWatch, and Auto Scaling.
+## Services
+- **auth-service** (ALB route prefix: `/auth`)
+- **user-service** (ALB route prefix: `/users`)
+- **billing-service** (ALB route prefix: `/billing`)
+- **notification-service** (ALB route prefix: `/notify`)
 
-The platform is designed to be deployed using CloudFormation and container images stored in Amazon ECR.
+## Alignment to Reference Spec
+From `systemoverview/service-deployment-spec.md`:
+- **Base image:** Amazon Linux 2
+- **Runtime:** Node.js 20
+- **Health checks:** `/health`
+- **Env vars:** `DB_ENDPOINT`, `SQS_QUEUE_URL`, `LOG_LEVEL`, `ENVIRONMENT`
 
-## Architecture Summary
+This repo matches the spec and also implements `/<prefix>/health` so external ALB path routing remains functional.
 
-![Diagram]./architecture.png
+---
 
-* **Compute:** Amazon ECS (Fargate)
-* **Ingress:** Application Load Balancer (HTTPS, TLS via ACM)
-* **Networking:** VPC with 2 public + 4 private subnets, NAT Gateways
-* **Services:** auth-service, user-service, billing-service, notification-service
-* **Data:** Amazon RDS (PostgreSQL)
-* **Messaging:** Amazon SQS with DLQ
-* **Config & Secrets:** SSM Parameter Store, AWS Secrets Manager
-* **Observability:** CloudWatch Logs (KMS encrypted), Metrics, Alarms
-* **Scaling:** ECS Service Auto Scaling (CPU target tracking)
+## Architecture
 
-## Repository Structure
-```
-microservices-platform/
-├── cloudformation/
-│   └── microserviceplatform.yaml
-├── services/
-│   ├── auth-service/
-│   │   ├── Dockerfile
-│   │   ├── requirements.txt
-│   │   └── app/main.py
-│   ├── user-service/
-│   ├── billing-service/
-│   └── notification-service/
-├── README.md
-└── .gitignore
-```
+![Diagram](./architecture.png)
 
-## Prerequisites
+**Routing model:**
+- ALB listener rules forward `/auth/*`, `/users/*`, `/billing/*`, `/notify/*` to the respective ECS services.
+- Each container exposes:
+  - `/health` (target group health checks)
+  - `/<prefix>/health` (validation via ALB path rules)
 
-Ensure the following are installed and configured:
-* AWS CLI v2 (aws --version)
-* Docker (with Buildx enabled)
-* Git
-* An AWS account with permissions for:
-  * CloudFormation
-  * ECS, ECR
-  * EC2/VPC
-  * RDS
-  * SQS
-  * IAM
-  * CloudWatch
-  * Secrets Manager
-  * SSM Parameter Store
-  * An ACM certificate issued in the target region (for HTTPS)
+---
 
-## Environment Setup
-```
-export AWS_REGION="us-east-1"
-export ENV="dev"               
+# Prerequisites
+
+- AWS CLI v2
+- Docker with Buildx enabled
+- An ACM certificate in the same region as the stack
+
+Set shell variables:
+
+```bash
+export AWS_REGION="us-east-2"     # set to your region
+export ENV="dev"                  # dev or staging
 export STACK_NAME="$ENV-microservices-platform"
 export ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 ```
 
-## Step 1: Deploy CloudFormation Infrastructure
-Validate template
-```
+---
+
+# Step 1 — Deploy CloudFormation
+
+Infrastructure template:
+- `cloudformation/microservicesplatform.yaml` ✅ (note: **services** plural)
+
+Validate:
+
+```bash
 aws cloudformation validate-template \
-  --template-body file://cloudformation/microserviceplatform.yaml
+  --region "$AWS_REGION" \
+  --template-body file://cloudformation/microservicesplatform.yaml
 ```
 
-Deploy stack
-```
+Deploy (**required parameters included**):
+
+```bash
 aws cloudformation deploy \
+  --region "$AWS_REGION" \
   --stack-name "$STACK_NAME" \
   --template-file cloudformation/microservicesplatform.yaml \
   --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides \
     EnvironmentName="$ENV" \
-    AcmCertificateArn="arn:aws:acm:us-east-1:ACCOUNT_ID:certificate/XXXXXXXX"
-```    
-
-## Wait for completion
+    AcmCertificateArn="arn:aws:acm:$AWS_REGION:$ACCOUNT_ID:certificate/REPLACE_ME" \
+    DbPassword="REPLACE_WITH_STRONG_PASSWORD"
 ```
+
+Wait:
+
+```bash
 aws cloudformation wait stack-create-complete \
+  --region "$AWS_REGION" \
   --stack-name "$STACK_NAME"
 ```
 
+Capture ALB DNS name:
 
-This step provisions:
-* VPC, subnets, NAT Gateways
-* ALB (HTTP → HTTPS redirect)
-* ECS Cluster
-* ECR repositories (4)
-* RDS PostgreSQL
-* SQS + DLQ
-* IAM roles (least privilege)
-* CloudWatch log groups, alarms
-* ECS services & auto scaling
+```bash
+export ALB_DNS="$(aws cloudformation describe-stacks \
+  --region "$AWS_REGION" \
+  --stack-name "$STACK_NAME" \
+  --query 'Stacks[0].Outputs[?OutputKey==`AlbDnsName`].OutputValue' \
+  --output text)"
 
-## Step 2: Build & Push Container Images to ECR
-
-Important: ECS Fargate expects linux/amd64.
-If building on Apple Silicon (M1/M2/M3), you must use multi-arch builds.
-
-Enable Docker Buildx (one-time)
+echo "ALB: $ALB_DNS"
 ```
+
+---
+
+# Step 2 — Build & Push Images to ECR
+
+CloudFormation creates ECR repos:
+- `$ENV/auth-service`
+- `$ENV/user-service`
+- `$ENV/billing-service`
+- `$ENV/notification-service`
+
+## 2.1 Login to ECR
+
+```bash
+aws ecr get-login-password --region "$AWS_REGION" \
+  | docker login --username AWS --password-stdin \
+    "$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+```
+
+## 2.2 Enable Buildx (recommended)
+
+```bash
 docker buildx create --name multiarch --use 2>/dev/null || docker buildx use multiarch
 docker buildx inspect --bootstrap
 ```
 
-Authenticate Docker to ECR
-```
-aws ecr get-login-password --region "$AWS_REGION" \
-  | docker login --username AWS --password-stdin \
-  "$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
-```
+## 2.3 Build + Push (multi-arch)
 
-Build & push all services (multi-arch)
-```
+> ECS/Fargate commonly pulls `linux/amd64`. Building multi-arch prevents `CannotPullContainerError` on Apple Silicon.
+
+```bash
 export TAG="latest"
 ECR="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
 
-docker buildx build --platform linux/amd64,linux/arm64 \
-  -t "$ECR/$ENV/auth-service:$TAG" \
-  --push ./services/auth-service
+for svc in auth-service user-service billing-service notification-service; do
+  docker buildx build --platform linux/amd64,linux/arm64 \
+    -t "$ECR/$ENV/$svc:$TAG" \
+    --push ./services/$svc
 
-docker buildx build --platform linux/amd64,linux/arm64 \
-  -t "$ECR/$ENV/user-service:$TAG" \
-  --push ./services/user-service
-
-docker buildx build --platform linux/amd64,linux/arm64 \
-  -t "$ECR/$ENV/billing-service:$TAG" \
-  --push ./services/billing-service
-
-docker buildx build --platform linux/amd64,linux/arm64 \
-  -t "$ECR/$ENV/notification-service:$TAG" \
-  --push ./services/notification-service
+done
 ```
 
-Verify image manifests include amd64
-```
-aws ecr describe-images \
+---
+
+# Step 3 — Update ECS Services to Use the Image Tags
+
+If you pushed images after stack creation (or changed tags), re-deploy the stack with image tag parameters:
+
+```bash
+aws cloudformation deploy \
   --region "$AWS_REGION" \
-  --repository-name "$ENV/auth-service"
-```
-
-## Step 3: Update ECS Services (if images were pushed after stack creation)
-
-If the stack was created before images existed, update it to force ECS to pull images:
-
-```
-aws cloudformation update-stack \
   --stack-name "$STACK_NAME" \
-  --use-previous-template \
+  --template-file cloudformation/microservicesplatform.yaml \
   --capabilities CAPABILITY_NAMED_IAM \
-  --parameters \
-    ParameterKey=AuthImageTag,ParameterValue="$TAG" \
-    ParameterKey=UserImageTag,ParameterValue="$TAG" \
-    ParameterKey=BillingImageTag,ParameterValue="$TAG" \
-    ParameterKey=NotificationImageTag,ParameterValue="$TAG"
+  --parameter-overrides \
+    EnvironmentName="$ENV" \
+    AcmCertificateArn="arn:aws:acm:$AWS_REGION:$ACCOUNT_ID:certificate/REPLACE_ME" \
+    DbPassword="REPLACE_WITH_STRONG_PASSWORD" \
+    AuthImageTag="$TAG" \
+    UserImageTag="$TAG" \
+    BillingImageTag="$TAG" \
+    NotificationImageTag="$TAG"
 ```
 
-Or simply force a new deployment:
+---
 
-```
-aws ecs update-service \
-  --cluster "$ENV-ecs-cluster" \
-  --service "$ENV-auth-service" \
-  --force-new-deployment
-```
+# Step 4 — Validate Routing + Health
 
-(Repeat for other services if needed.)
+Validate each service through ALB path rules:
 
-## Step 4: Verify Deployment
-Get ALB endpoint
-```
-aws cloudformation describe-stacks \
-  --stack-name "$STACK_NAME" \
-  --query "Stacks[0].Outputs[?OutputKey=='AlbDnsName'].OutputValue" \
-  --output text
+```bash
+curl -sk "https://$ALB_DNS/auth/health" | cat
+curl -sk "https://$ALB_DNS/users/health" | cat
+curl -sk "https://$ALB_DNS/billing/health" | cat
+curl -sk "https://$ALB_DNS/notify/health" | cat
 ```
 
-Health checks
-```
-curl -k https://<ALB_DNS>/auth/health
-curl -k https://<ALB_DNS>/users/health
-curl -k https://<ALB_DNS>/billing/health
-curl -k https://<ALB_DNS>/notify/health
-```
+Expected: HTTP 200 and JSON payload with `status: ok`.
 
+---
 
-Expected response:
-```
-{
-  "status": "ok",
-  "checks": {
-    "db_tcp": true,
-    "sqs_access": true
-  }
-}
-```
+# Security & Compliance Notes
 
-Step 5: Observability & Operations
-* Logs: CloudWatch → `/ecs/<env>/<service-name>`
-* Metrics: ECS CPU/Memory, ALB request counts
+- Secrets are stored in **AWS Secrets Manager** and encrypted with a **customer-managed KMS key** (`SecretsKmsKey`).
+- CloudWatch log groups are encrypted using **LogsKmsKey** via `KmsKeyId`.
+- ECS tasks use scoped IAM permissions for:
+  - `secretsmanager:GetSecretValue` (DB secret)
+  - `kms:Decrypt` / `kms:DescribeKey` (SecretsKmsKey and LogsKmsKey)
+  - `ssm:GetParametersByPath` (platform config path)
+  - `sqs:*` limited to the platform queues
 
-Alarms:
-* ALB 5XX errors
-* ECS service CPU high
-* Scaling: Automatic ECS task scaling based on CPU utilization
+---
 
-Security Notes
-* No hard-coded credentials
-* Secrets stored in Secrets Manager (KMS-encrypted)
-* Config in SSM Parameter Store
-* ECS Task Roles use least-privilege IAM
-* Private subnets with NAT egress only
-*TLS enforced at ALB
+# Troubleshooting
 
-Common Errors & Fixes
-* CannotPullContainerError: platform linux/amd64
-  Fix: Rebuild images using docker buildx --platform linux/amd64,linux/arm64.
+## CannotPullContainerError (platform linux/amd64)
+Rebuild and push multi-arch images using Buildx (Step 2.2 + 2.3).
 
-* Tasks stuck in PENDING
-  Check NAT Gateway routes
-
-* Verify subnets and security groups
-  Confirm image exists in ECR
-
-* Health checks failing
-  Ensure /health endpoint exists
-  Confirm container port matches target group port
+## ALB returns 404
+- Confirm you are calling a valid prefix route: `/auth/*`, `/users/*`, `/billing/*`, `/notify/*`.
+- Confirm the target ECS service is healthy in its target group.
 
