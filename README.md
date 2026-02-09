@@ -6,9 +6,21 @@ This repository contains a production-style repo for deploying a distributed mic
 
 The platform is designed to be deployed using CloudFormation and container images stored in Amazon ECR.
 
+## Services
+- **auth-service** (ALB route prefix: `/auth`)
+- **user-service** (ALB route prefix: `/users`)
+- **billing-service** (ALB route prefix: `/billing`)
+- **notification-service** (ALB route prefix: `/notify`)
+
 ## Architecture Summary
 
 ![Diagram](./architecture.png)
+
+**Routing model:**
+- ALB listener rules forward `/auth/*`, `/users/*`, `/billing/*`, `/notify/*` to the respective ECS services.
+- Each container exposes:
+  - `/health` (target group health checks)
+  - `/<prefix>/health` (validation via ALB path rules)
 
 * **Compute:** Amazon ECS (Fargate)
 * **Ingress:** Application Load Balancer (HTTPS, TLS via ACM)
@@ -19,6 +31,8 @@ The platform is designed to be deployed using CloudFormation and container image
 * **Config & Secrets:** SSM Parameter Store, AWS Secrets Manager
 * **Observability:** CloudWatch Logs (KMS encrypted), Metrics, Alarms
 * **Scaling:** ECS Service Auto Scaling (CPU target tracking)
+
+
 
 ## Repository Structure
 ```
@@ -88,6 +102,17 @@ aws cloudformation wait stack-create-complete \
   --stack-name "$STACK_NAME"
 ```
 
+Capture ALB DNS name:
+
+```bash
+export ALB_DNS="$(aws cloudformation describe-stacks \
+  --region "$AWS_REGION" \
+  --stack-name "$STACK_NAME" \
+  --query 'Stacks[0].Outputs[?OutputKey==`AlbDnsName`].OutputValue' \
+  --output text)"
+
+echo "ALB: $ALB_DNS"
+```
 
 This step provisions:
 * VPC, subnets, NAT Gateways
@@ -160,7 +185,9 @@ aws cloudformation update-stack \
     ParameterKey=AuthImageTag,ParameterValue="$TAG" \
     ParameterKey=UserImageTag,ParameterValue="$TAG" \
     ParameterKey=BillingImageTag,ParameterValue="$TAG" \
-    ParameterKey=NotificationImageTag,ParameterValue="$TAG"
+    ParameterKey=NotificationImageTag,ParameterValue="$TAG" \
+    ParameterKey=DesiredCount,ParameterValue="2"
+ 
 ```
 
 Or simply force a new deployment:
@@ -175,13 +202,6 @@ aws ecs update-service \
 (Repeat for other services if needed.)
 
 ## Step 4: Verify Deployment
-Get ALB endpoint
-```
-aws cloudformation describe-stacks \
-  --stack-name "$STACK_NAME" \
-  --query "Stacks[0].Outputs[?OutputKey=='AlbDnsName'].OutputValue" \
-  --output text
-```
 
 Health checks
 ```
@@ -194,13 +214,7 @@ curl -k https://<ALB_DNS>/notify/health
 
 Expected response:
 ```
-{
-  "status": "ok",
-  "checks": {
-    "db_tcp": true,
-    "sqs_access": true
-  }
-}
+Expected: HTTP 200 and JSON payload with `status: ok`.
 ```
 
 Step 5: Observability & Operations
