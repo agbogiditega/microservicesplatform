@@ -1,17 +1,24 @@
-FROM python:3.12-slim
+FROM public.ecr.aws/amazonlinux/amazonlinux:2
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+# Install Node.js 20 (NodeSource) + minimal tools
+RUN yum -y update \
+    && yum -y install curl ca-certificates \
+    && curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - \
+    && yum -y install nodejs \
+    && yum -y clean all \
+    && rm -rf /var/cache/yum
 
 WORKDIR /app
 
-RUN adduser --disabled-password --gecos "" appuser
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Create non-root user
+RUN useradd -m appuser
 
-COPY app ./app
+COPY package.json package-lock.json* ./
+RUN npm ci --omit=dev || npm install --omit=dev
+
+COPY src ./src
+
 USER appuser
-
 EXPOSE 8080
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
 
+CMD ["npm", "start"]
